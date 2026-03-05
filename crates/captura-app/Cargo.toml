@@ -1,0 +1,22 @@
+[package]
+name = "captura-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "captura"
+path = "src/main.rs"
+
+[dependencies]
+captura-config = { path = "../captura-config" }
+captura-capture = { path = "../captura-capture" }
+captura-encoder = { path = "../captura-encoder" }
+captura-audio = { path = "../captura-audio" }
+captura-storage = { path = "../captura-storage" }
+captura-hotkeys = { path = "../captura-hotkeys" }
+captura-ui = { path = "../captura-ui" }
+log = { workspace = true }
+env_logger = { workspace = true }
+dirs = "6"
+libc = "0.2"
+ctrlc = "3"

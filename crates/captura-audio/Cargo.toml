@@ -1,0 +1,9 @@
+[package]
+name = "captura-audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+log = { workspace = true }
+cpal = "0.15"

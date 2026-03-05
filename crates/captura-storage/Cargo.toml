@@ -1,0 +1,13 @@
+[package]
+name = "captura-storage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+captura-config = { path = "../captura-config" }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

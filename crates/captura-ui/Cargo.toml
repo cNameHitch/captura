@@ -1,0 +1,17 @@
+[package]
+name = "captura-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+captura-config = { path = "../captura-config" }
+captura-capture = { path = "../captura-capture" }
+captura-encoder = { path = "../captura-encoder" }
+captura-audio = { path = "../captura-audio" }
+captura-storage = { path = "../captura-storage" }
+captura-hotkeys = { path = "../captura-hotkeys" }
+thiserror = { workspace = true }
+log = { workspace = true }
+image = { workspace = true }
+tao = "0.31"
+muda = "0.15"
