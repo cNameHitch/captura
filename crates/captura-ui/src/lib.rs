@@ -1,11 +1,9 @@
-use captura_audio::{AudioCapturer, AudioConfig, AudioHandle};
-use captura_capture::{CaptureRegion, CaptureStreamHandle, Capturer, Frame};
+use captura_capture::CaptureRegion;
 use captura_config::Config;
-use captura_encoder::{EncodedFile, Encoder, EncoderConfig, VideoFormat};
 use captura_hotkeys::HotkeyManager;
 use captura_storage::{CaptureType, StorageManager};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command};
 use std::time::Instant;
 
 #[derive(Debug, thiserror::Error)]
@@ -16,14 +14,8 @@ pub enum UiError {
     #[error("Capture error: {0}")]
     Capture(#[from] captura_capture::CaptureError),
 
-    #[error("Encoder error: {0}")]
-    Encoder(#[from] captura_encoder::EncoderError),
-
     #[error("Storage error: {0}")]
     Storage(#[from] captura_storage::StorageError),
-
-    #[error("Audio error: {0}")]
-    Audio(#[from] captura_audio::AudioError),
 
     #[error("UI error: {0}")]
     Ui(String),
@@ -45,9 +37,9 @@ enum AppCommand {
 }
 
 struct RecordingSession {
-    _stream_handle: CaptureStreamHandle,
-    _audio_handle: Option<AudioHandle>,
-    encoder: Option<Encoder>,
+    /// The screencapture child process performing the recording.
+    child: Child,
+    output_path: PathBuf,
     started_at: Instant,
 }
 
@@ -84,7 +76,7 @@ impl App {
         self.config = config;
     }
 
-    /// Take a screenshot of the full display.
+    /// Take a screenshot of the full display using macOS screencapture.
     pub fn take_screenshot(&mut self) -> Result<PathBuf, UiError> {
         if self.config.capture.screenshot_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(
@@ -92,134 +84,76 @@ impl App {
             ));
         }
 
-        let capturer = Capturer::new(
-            CaptureRegion::Display(self.config.capture.display_index),
-            self.config.capture.include_cursor,
-        )?;
-
-        let frame = capturer.capture_frame()?;
         let path = self.storage.resolve_path(CaptureType::Screenshot)?;
 
-        save_frame_as_image(&frame, &path, &self.config.output.screenshot_format)?;
-
-        self.last_capture = Some(path.clone());
-        self.post_capture_actions(&path);
-        Ok(path)
-    }
-
-    /// Take a screenshot of a specific region.
-    pub fn take_region_screenshot(
-        &mut self,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-    ) -> Result<PathBuf, UiError> {
-        let capturer = Capturer::new(
-            CaptureRegion::Rect {
-                display: self.config.capture.display_index,
-                x,
-                y,
-                width,
-                height,
-            },
+        let region = CaptureRegion::Display(self.config.capture.display_index);
+        captura_capture::screencapture_to_file(
+            &path,
+            &region,
             self.config.capture.include_cursor,
         )?;
 
-        let frame = capturer.capture_frame()?;
-        let path = self.storage.resolve_path(CaptureType::RegionScreenshot)?;
-
-        save_frame_as_image(&frame, &path, &self.config.output.screenshot_format)?;
-
+        log::info!("Screenshot saved: {}", path.display());
         self.last_capture = Some(path.clone());
         self.post_capture_actions(&path);
         Ok(path)
     }
 
-    /// Start recording.
+    /// Take an interactive region screenshot using macOS screencapture -i.
+    pub fn take_region_screenshot_interactive(&mut self) -> Result<Option<PathBuf>, UiError> {
+        let path = self.storage.resolve_path(CaptureType::RegionScreenshot)?;
+
+        let captured = captura_capture::screencapture_region_interactive(&path)?;
+        if !captured {
+            log::info!("Region screenshot cancelled by user");
+            return Ok(None);
+        }
+
+        log::info!("Region screenshot saved: {}", path.display());
+        self.last_capture = Some(path.clone());
+        self.post_capture_actions(&path);
+        Ok(Some(path))
+    }
+
+    /// Start recording using macOS native screencapture -v.
     pub fn start_recording(&mut self) -> Result<(), UiError> {
         if self.state == AppState::Recording {
             return Ok(());
         }
 
         let path = self.storage.resolve_path(CaptureType::Recording)?;
-        let capturer = Capturer::new(
-            CaptureRegion::Display(self.config.capture.display_index),
-            self.config.capture.include_cursor,
-        )?;
 
-        // Capture one frame to get dimensions
-        let probe = capturer.capture_frame()?;
-        let width = probe.width;
-        let height = probe.height;
+        // Use macOS screencapture -v for video recording.
+        // This handles Screen Recording permissions natively.
+        let mut cmd = Command::new("screencapture");
+        cmd.arg("-v"); // video mode
+        cmd.arg("-D").arg(format!("{}", self.config.capture.display_index + 1));
+        if self.config.capture.include_cursor {
+            cmd.arg("-C"); // capture cursor
+        }
+        if self.config.recording.capture_microphone {
+            cmd.arg("-A"); // capture audio
+        }
+        cmd.arg(&path);
 
-        let format = match self.config.output.video_format.as_str() {
-            "mov" => VideoFormat::Mov,
-            "gif" => VideoFormat::Gif,
-            _ => VideoFormat::Mp4,
-        };
-
-        let encoder = Encoder::new(EncoderConfig {
-            output_path: path.clone(),
-            fps: self.config.recording.fps,
-            bitrate_kbps: self.config.recording.bitrate_kbps,
-            width,
-            height,
-            format,
+        let child = cmd.spawn().map_err(|e| {
+            UiError::Ui(format!("Failed to start screencapture: {e}"))
         })?;
 
-        // Share encoder with the stream callback via Arc<Mutex>
-        let encoder_shared = Arc::new(Mutex::new(Some(encoder)));
-        let encoder_for_stream = encoder_shared.clone();
-
-        let stream = capturer.start_stream(self.config.recording.fps, move |frame| {
-            if let Ok(guard) = encoder_for_stream.lock() {
-                if let Some(enc) = guard.as_ref() {
-                    if let Err(e) = enc.push_frame(frame) {
-                        log::warn!("Failed to push frame: {e}");
-                    }
-                }
-            }
-        })?;
-
-        // Audio capture
-        let audio_handle = if self.config.recording.capture_microphone
-            || self.config.recording.capture_system_audio
-        {
-            let audio = AudioCapturer::new(AudioConfig {
-                capture_microphone: self.config.recording.capture_microphone,
-                capture_system_audio: self.config.recording.capture_system_audio,
-                ..AudioConfig::default()
-            })?;
-            Some(audio.start(|_samples| {
-                // Audio muxing into the video is future work.
-            })?)
-        } else {
-            None
-        };
-
-        // Take the encoder out of the Arc for storage in the session.
-        // The stream callback's Arc clone still holds a reference, but we've already
-        // started the stream. We'll take it back when stopping.
-        let encoder_owned = Arc::try_unwrap(encoder_shared)
-            .ok()
-            .and_then(|m| m.into_inner().ok())
-            .flatten();
+        log::info!("Recording started: {}", path.display());
 
         self.recording_session = Some(RecordingSession {
-            _stream_handle: stream,
-            _audio_handle: audio_handle,
-            encoder: encoder_owned,
+            child,
+            output_path: path,
             started_at: Instant::now(),
         });
 
         self.state = AppState::Recording;
-        self.last_capture = Some(path);
         Ok(())
     }
 
-    /// Stop recording and finalize the file.
-    pub fn stop_recording(&mut self) -> Result<Option<EncodedFile>, UiError> {
+    /// Stop recording by sending SIGINT to screencapture (graceful stop).
+    pub fn stop_recording(&mut self) -> Result<Option<PathBuf>, UiError> {
         if self.state != AppState::Recording {
             return Ok(None);
         }
@@ -228,15 +162,38 @@ impl App {
         self.state = AppState::Idle;
 
         if let Some(mut session) = session {
-            // Drop stream + audio handles first to stop capture
-            drop(session._stream_handle);
-            drop(session._audio_handle);
+            let elapsed = session.started_at.elapsed().as_secs_f64();
 
-            if let Some(encoder) = session.encoder.take() {
-                let encoded = encoder.finish()?;
-                self.last_capture = Some(encoded.path.clone());
-                self.post_capture_actions(&encoded.path);
-                return Ok(Some(encoded));
+            // Send SIGINT to screencapture for graceful stop (finalizes the file)
+            #[cfg(unix)]
+            {
+                let pid = session.child.id();
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGINT);
+                }
+            }
+
+            // Wait for the process to finish writing
+            match session.child.wait() {
+                Ok(status) => {
+                    log::info!(
+                        "Recording saved: {} ({:.1}s, exit: {})",
+                        session.output_path.display(),
+                        elapsed,
+                        status
+                    );
+                }
+                Err(e) => {
+                    log::error!("Failed to wait for screencapture: {e}");
+                }
+            }
+
+            if session.output_path.exists() {
+                self.last_capture = Some(session.output_path.clone());
+                self.post_capture_actions(&session.output_path);
+                return Ok(Some(session.output_path));
+            } else {
+                log::error!("Recording file was not created");
             }
         }
 
@@ -244,7 +201,7 @@ impl App {
     }
 
     /// Toggle recording on/off.
-    pub fn toggle_recording(&mut self) -> Result<Option<EncodedFile>, UiError> {
+    pub fn toggle_recording(&mut self) -> Result<Option<PathBuf>, UiError> {
         match self.state {
             AppState::Idle => {
                 self.start_recording()?;
@@ -288,31 +245,6 @@ impl App {
     }
 }
 
-fn save_frame_as_image(frame: &Frame, path: &PathBuf, format: &str) -> Result<(), UiError> {
-    // Frame data is BGRA, convert to RGBA for image crate
-    let mut rgba = Vec::with_capacity(frame.data.len());
-    for chunk in frame.data.chunks_exact(4) {
-        rgba.push(chunk[2]); // R
-        rgba.push(chunk[1]); // G
-        rgba.push(chunk[0]); // B
-        rgba.push(chunk[3]); // A
-    }
-
-    let img = image::RgbaImage::from_raw(frame.width, frame.height, rgba)
-        .ok_or_else(|| UiError::Ui("failed to create image from frame data".to_string()))?;
-
-    let img = image::DynamicImage::ImageRgba8(img);
-
-    match format {
-        "jpg" | "jpeg" => img.save_with_format(path, image::ImageFormat::Jpeg),
-        "webp" => img.save_with_format(path, image::ImageFormat::WebP),
-        _ => img.save_with_format(path, image::ImageFormat::Png),
-    }
-    .map_err(|e| UiError::Ui(format!("save image: {e}")))?;
-
-    Ok(())
-}
-
 fn copy_to_clipboard(path: &PathBuf) {
     #[cfg(target_os = "macos")]
     {
@@ -347,14 +279,15 @@ fn show_notification(path: &PathBuf) {
     }
 }
 
-/// Build and run the tao event loop with muda menus.
+/// Build and run the tao event loop with a system tray icon and menu.
 /// Uses channels so the hotkey thread sends commands to the main thread,
 /// avoiding the need to share non-Send types across threads.
 pub fn run_event_loop(config: Config) -> Result<(), UiError> {
-    use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use std::sync::mpsc;
     use tao::event::{Event, StartCause};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::TrayIconBuilder;
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<AppCommand>();
 
@@ -363,12 +296,12 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
 
     let event_loop = EventLoopBuilder::new().build();
 
-    // Build menu
+    // Build tray menu
     let menu = Menu::new();
 
-    let screenshot_item = MenuItem::new("Take Screenshot\tCmd+Shift+3", true, None);
-    let region_item = MenuItem::new("Capture Region\tCmd+Shift+4", true, None);
-    let record_item = MenuItem::new("Start Recording\tCmd+Shift+5", true, None);
+    let screenshot_item = MenuItem::new("Take Screenshot          Cmd+Shift+3", true, None);
+    let region_item = MenuItem::new("Capture Region            Cmd+Shift+4", true, None);
+    let record_item = MenuItem::new("Start Recording          Cmd+Shift+5", true, None);
     let open_last_item = MenuItem::new("Open Last Capture", false, None);
     let open_folder_item = MenuItem::new("Open Capture Folder", true, None);
     let quit_item = MenuItem::new("Quit Captura", true, None);
@@ -389,6 +322,17 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
     let open_last_id = open_last_item.id().clone();
     let open_folder_id = open_folder_item.id().clone();
     let quit_id = quit_item.id().clone();
+
+    // Create a simple camera icon (16x16 white on transparent)
+    let icon = create_tray_icon();
+
+    let _tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Captura")
+        .with_icon(icon)
+        .with_menu_on_left_click(true)
+        .build()
+        .map_err(|e| UiError::Ui(format!("failed to create tray icon: {e}")))?;
 
     // Hotkey thread — sends commands via channel
     let hk_tx = cmd_tx.clone();
@@ -447,8 +391,7 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
                     }
                 }
                 AppCommand::TakeRegionScreenshot => {
-                    // Region selection UI is future work; full-screen fallback
-                    if let Err(e) = app.take_screenshot() {
+                    if let Err(e) = app.take_region_screenshot_interactive() {
                         log::error!("Region screenshot failed: {e}");
                     }
                 }
@@ -465,30 +408,47 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
         }
 
         // Process menu events
-        while let Ok(event) = menu_rx.try_recv() {
-            if event.id == screenshot_id {
+        while let Ok(menu_event) = menu_rx.try_recv() {
+            if menu_event.id == screenshot_id {
                 if let Err(e) = app.take_screenshot() {
                     log::error!("Screenshot failed: {e}");
                 }
-            } else if event.id == region_id {
-                if let Err(e) = app.take_screenshot() {
+            } else if menu_event.id == region_id {
+                if let Err(e) = app.take_region_screenshot_interactive() {
                     log::error!("Region screenshot failed: {e}");
                 }
-            } else if event.id == record_id {
-                if let Err(e) = app.toggle_recording() {
-                    log::error!("Toggle recording failed: {e}");
+            } else if menu_event.id == record_id {
+                match app.state() {
+                    AppState::Idle => {
+                        if let Err(e) = app.start_recording() {
+                            log::error!("Start recording failed: {e}");
+                        } else {
+                            let _ = record_item.set_text("● Stop Recording          Cmd+Shift+5");
+                        }
+                    }
+                    AppState::Recording => {
+                        if let Err(e) = app.stop_recording() {
+                            log::error!("Stop recording failed: {e}");
+                        }
+                        let _ = record_item.set_text("Start Recording          Cmd+Shift+5");
+                    }
                 }
-            } else if event.id == open_last_id {
+            } else if menu_event.id == open_last_id {
                 if let Err(e) = app.open_last_capture() {
                     log::error!("Open last capture failed: {e}");
                 }
-            } else if event.id == open_folder_id {
+            } else if menu_event.id == open_folder_id {
                 if let Err(e) = app.open_capture_folder() {
                     log::error!("Open capture folder failed: {e}");
                 }
-            } else if event.id == quit_id {
+            } else if menu_event.id == quit_id {
                 let _ = app.stop_recording();
                 *control_flow = ControlFlow::Exit;
+            }
+
+            // Enable "Open Last Capture" once we have one
+            if app.last_capture().is_some() {
+                let _ = open_last_item.set_enabled(true);
             }
         }
 
@@ -496,4 +456,50 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
             log::info!("Captura UI initialized");
         }
     });
+}
+
+/// Create a simple 22x22 camera icon for the menu bar.
+fn create_tray_icon() -> tray_icon::Icon {
+    let size = 22u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+
+    // Draw a simple camera shape (white pixels on transparent background)
+    // Body: rounded rectangle from (3,8) to (19,18)
+    for y in 8..=18 {
+        for x in 3..=19 {
+            let idx = ((y * size + x) * 4) as usize;
+            rgba[idx] = 255;     // R
+            rgba[idx + 1] = 255; // G
+            rgba[idx + 2] = 255; // B
+            rgba[idx + 3] = 200; // A
+        }
+    }
+
+    // Viewfinder bump: (8,5) to (14,8)
+    for y in 5..=8 {
+        for x in 8..=14 {
+            let idx = ((y * size + x) * 4) as usize;
+            rgba[idx] = 255;
+            rgba[idx + 1] = 255;
+            rgba[idx + 2] = 255;
+            rgba[idx + 3] = 200;
+        }
+    }
+
+    // Lens: hollow circle center (11,13) radius 3 — cut out inner pixels
+    let cx = 11.0f64;
+    let cy = 13.0f64;
+    for y in 9..=17 {
+        for x in 7..=15 {
+            let dx = x as f64 - cx;
+            let dy = y as f64 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= 2.5 {
+                let idx = ((y * size + x as u32) * 4) as usize;
+                rgba[idx + 3] = 0; // transparent (cut out lens)
+            }
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, size, size).expect("failed to create tray icon")
 }

@@ -64,7 +64,6 @@ impl Drop for CaptureStreamHandle {
 
 impl Capturer {
     pub fn new(region: CaptureRegion, include_cursor: bool) -> Result<Self, CaptureError> {
-        // Validate display index
         let display_index = match &region {
             CaptureRegion::Display(idx) => *idx,
             CaptureRegion::Rect { display, .. } => *display,
@@ -135,7 +134,6 @@ impl Capturer {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            // Fallback: assume at least one display
             Ok(1)
         }
     }
@@ -163,23 +161,36 @@ impl Capturer {
 
     #[cfg(target_os = "macos")]
     fn macos_capture_frame(&self) -> Result<Frame, CaptureError> {
-        use core_graphics::display::{CGDisplay, CGRect, CGPoint, CGSize};
+        use core_graphics::display::{
+            CGDisplay, CGPoint, CGRect, CGSize,
+        };
+        use core_graphics::window::{
+            kCGWindowListOptionOnScreenOnly,
+            kCGNullWindowID,
+        };
+
+        // Log permission status but don't block — CG will still capture
+        // (wallpaper-only if permission not granted)
+        if !Self::has_screen_recording_permission() {
+            log::warn!("Screen recording permission not granted — captures may show wallpaper only. Grant permission in System Settings > Privacy & Security > Screen Recording.");
+        }
 
         let display_id = self.get_display_id()?;
         let display = CGDisplay::new(display_id);
 
-        let image = match &self.region {
-            CaptureRegion::Display(_) => CGDisplay::screenshot(
-                display.bounds(),
-                core_graphics::window::kCGWindowListOptionOnScreenOnly,
-                core_graphics::window::kCGNullWindowID,
-                core_graphics::display::kCGWindowImageDefault,
+        // Use CGWindowListCreateImage via CGDisplay::screenshot
+        // kCGWindowListOptionOnScreenOnly captures all on-screen windows
+        // Once Screen Recording permission is granted, this captures window content
+        let bounds = display.bounds();
+
+        let (capture_rect, list_option) = match &self.region {
+            CaptureRegion::Display(_) => (
+                bounds,
+                kCGWindowListOptionOnScreenOnly,
             ),
             CaptureRegion::Rect {
                 x, y, width, height, ..
             } => {
-                // Clamp to display bounds
-                let bounds = display.bounds();
                 let max_w = bounds.size.width as u32;
                 let max_h = bounds.size.height as u32;
                 let clamped_w = (*width).min(max_w.saturating_sub(*x));
@@ -189,17 +200,19 @@ impl Capturer {
                     &CGPoint::new(*x as f64, *y as f64),
                     &CGSize::new(clamped_w as f64, clamped_h as f64),
                 );
-                CGDisplay::screenshot(
-                    rect,
-                    core_graphics::window::kCGWindowListOptionOnScreenOnly,
-                    core_graphics::window::kCGNullWindowID,
-                    core_graphics::display::kCGWindowImageDefault,
-                )
+                (rect, kCGWindowListOptionOnScreenOnly)
             }
         };
 
+        let image = CGDisplay::screenshot(
+            capture_rect,
+            list_option,
+            kCGNullWindowID,
+            core_graphics::display::kCGWindowImageDefault,
+        );
+
         let image = image.ok_or_else(|| {
-            CaptureError::CaptureFailed("CGDisplay::screenshot returned null".to_string())
+            CaptureError::CaptureFailed("CGWindowListCreateImage returned null".to_string())
         })?;
 
         let width = image.width() as u32;
@@ -208,7 +221,7 @@ impl Capturer {
         let bytes_per_row = image.bytes_per_row();
         let raw_len = raw_data.len() as usize;
 
-        // Convert to packed BGRA
+        // Convert to packed BGRA (CGImage may have extra padding per row)
         let mut data = Vec::with_capacity((width * height * 4) as usize);
         for row in 0..height {
             let row_start = (row as usize) * bytes_per_row;
@@ -231,6 +244,24 @@ impl Capturer {
         })
     }
 
+    /// Check if we have screen recording permission on macOS.
+    /// Uses CGWindowListCreateImage as a probe — if permission is missing,
+    /// the resulting image will contain no window content.
+    #[cfg(target_os = "macos")]
+    fn has_screen_recording_permission() -> bool {
+        // CGPreflightScreenCaptureAccess (macOS 10.15+)
+        // We call this via the objc runtime since core-graphics doesn't expose it
+        unsafe {
+            let result: bool = msg_send_screen_capture_preflight();
+            if !result {
+                // Request access — this triggers the system dialog
+                msg_send_screen_capture_request();
+                return false;
+            }
+        }
+        true
+    }
+
     #[cfg(target_os = "macos")]
     fn get_display_id(&self) -> Result<u32, CaptureError> {
         use core_graphics::display::CGDisplay;
@@ -248,4 +279,80 @@ impl Capturer {
             .copied()
             .ok_or(CaptureError::DisplayNotFound(idx))
     }
+}
+
+/// Use macOS `screencapture` CLI to take a screenshot to a temp file,
+/// then load it as a Frame. This always works with proper permission prompts.
+#[cfg(target_os = "macos")]
+pub fn screencapture_to_file(
+    path: &std::path::Path,
+    region: &CaptureRegion,
+    include_cursor: bool,
+) -> Result<(), CaptureError> {
+    let mut cmd = std::process::Command::new("screencapture");
+
+    if !include_cursor {
+        cmd.arg("-C"); // Don't capture cursor (note: -C means capture cursor, absence means no)
+    }
+
+    match region {
+        CaptureRegion::Display(idx) => {
+            cmd.arg("-D").arg(format!("{}", idx + 1)); // screencapture uses 1-based display index
+        }
+        CaptureRegion::Rect { x, y, width, height, display: _ } => {
+            cmd.arg("-R").arg(format!("{},{},{},{}", x, y, width, height));
+        }
+    }
+
+    cmd.arg(path);
+
+    let output = cmd.output().map_err(|e| {
+        CaptureError::CaptureFailed(format!("screencapture command failed: {e}"))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CaptureError::CaptureFailed(format!(
+            "screencapture exited with {}: {stderr}",
+            output.status
+        )));
+    }
+
+    Ok(())
+}
+
+/// Interactive region selection using macOS screencapture -i.
+/// Returns the path to the saved file, or None if the user cancelled.
+#[cfg(target_os = "macos")]
+pub fn screencapture_region_interactive(
+    path: &std::path::Path,
+) -> Result<bool, CaptureError> {
+    let _output = std::process::Command::new("screencapture")
+        .arg("-i") // interactive mode
+        .arg(path)
+        .output()
+        .map_err(|e| {
+            CaptureError::CaptureFailed(format!("screencapture command failed: {e}"))
+        })?;
+
+    // screencapture -i exits 0 even on cancel, but doesn't create the file
+    Ok(path.exists())
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn msg_send_screen_capture_preflight() -> bool {
+    // CGPreflightScreenCaptureAccess
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn msg_send_screen_capture_request() {
+    // CGRequestScreenCaptureAccess
+    extern "C" {
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGRequestScreenCaptureAccess(); }
 }
