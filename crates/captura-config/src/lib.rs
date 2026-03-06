@@ -110,14 +110,16 @@ pub struct HotkeyConfig {
     pub screenshot: String,
     pub toggle_recording: String,
     pub region_screenshot: String,
+    pub region_recording: String,
 }
 
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            screenshot: "Cmd+Shift+3".to_string(),
-            toggle_recording: "Cmd+Shift+5".to_string(),
-            region_screenshot: "Cmd+Shift+4".to_string(),
+            screenshot: "Ctrl+Shift+1".to_string(),
+            toggle_recording: "Ctrl+Shift+3".to_string(),
+            region_screenshot: "Ctrl+Shift+2".to_string(),
+            region_recording: "Ctrl+Shift+4".to_string(),
         }
     }
 }
@@ -255,7 +257,7 @@ mod tests {
 
         assert_eq!(deserialized.recording.fps, 30);
         assert_eq!(deserialized.output.screenshot_format, "png");
-        assert_eq!(deserialized.hotkeys.screenshot, "Cmd+Shift+3");
+        assert_eq!(deserialized.hotkeys.screenshot, "Ctrl+Shift+1");
         assert!(deserialized.ui.show_save_notification);
     }
 
@@ -268,7 +270,7 @@ include_cursor = false
         let config: Config = toml::from_str(partial).unwrap();
         assert!(!config.capture.include_cursor);
         assert_eq!(config.recording.fps, 30);
-        assert_eq!(config.hotkeys.screenshot, "Cmd+Shift+3");
+        assert_eq!(config.hotkeys.screenshot, "Ctrl+Shift+1");
     }
 
     #[test]

@@ -2,9 +2,12 @@ use captura_capture::CaptureRegion;
 use captura_config::Config;
 use captura_hotkeys::HotkeyManager;
 use captura_storage::{CaptureType, StorageManager};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Instant;
+
+const MAX_RECENT_CAPTURES: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UiError {
@@ -33,6 +36,7 @@ enum AppCommand {
     TakeScreenshot,
     TakeRegionScreenshot,
     ToggleRecording,
+    ToggleRegionRecording,
     UpdateConfig(Config),
 }
 
@@ -47,7 +51,7 @@ pub struct App {
     config: Config,
     storage: StorageManager,
     state: AppState,
-    last_capture: Option<PathBuf>,
+    recent_captures: VecDeque<PathBuf>,
     recording_session: Option<RecordingSession>,
 }
 
@@ -58,7 +62,7 @@ impl App {
             config,
             storage,
             state: AppState::Idle,
-            last_capture: None,
+            recent_captures: VecDeque::with_capacity(MAX_RECENT_CAPTURES),
             recording_session: None,
         }
     }
@@ -67,8 +71,15 @@ impl App {
         self.state
     }
 
-    pub fn last_capture(&self) -> Option<&PathBuf> {
-        self.last_capture.as_ref()
+    pub fn recent_captures(&self) -> &VecDeque<PathBuf> {
+        &self.recent_captures
+    }
+
+    fn add_recent_capture(&mut self, path: PathBuf) {
+        if self.recent_captures.len() >= MAX_RECENT_CAPTURES {
+            self.recent_captures.pop_back();
+        }
+        self.recent_captures.push_front(path);
     }
 
     pub fn update_config(&mut self, config: Config) {
@@ -94,7 +105,7 @@ impl App {
         )?;
 
         log::info!("Screenshot saved: {}", path.display());
-        self.last_capture = Some(path.clone());
+        self.add_recent_capture(path.clone());
         self.post_capture_actions(&path);
         Ok(path)
     }
@@ -110,7 +121,7 @@ impl App {
         }
 
         log::info!("Region screenshot saved: {}", path.display());
-        self.last_capture = Some(path.clone());
+        self.add_recent_capture(path.clone());
         self.post_capture_actions(&path);
         Ok(Some(path))
     }
@@ -135,12 +146,64 @@ impl App {
             cmd.arg("-A"); // capture audio
         }
         cmd.arg(&path);
+        // Pipe stdin so screencapture doesn't read keyboard input
+        // (it stops on "any character" otherwise)
+        cmd.stdin(std::process::Stdio::piped());
 
         let child = cmd.spawn().map_err(|e| {
             UiError::Ui(format!("Failed to start screencapture: {e}"))
         })?;
 
         log::info!("Recording started: {}", path.display());
+
+        self.recording_session = Some(RecordingSession {
+            child,
+            output_path: path,
+            started_at: Instant::now(),
+        });
+
+        self.state = AppState::Recording;
+        Ok(())
+    }
+
+    /// Start an interactive region recording.
+    /// Uses a helper to let the user select a region, then records with screencapture -v -R.
+    pub fn start_region_recording(&mut self) -> Result<(), UiError> {
+        if self.state == AppState::Recording {
+            return Ok(());
+        }
+
+        // Find the select-region helper next to the binary
+        let helper = find_helper("select-region");
+
+        let output = Command::new(&helper)
+            .output()
+            .map_err(|e| UiError::Ui(format!("Failed to run region selector: {e}")))?;
+
+        if !output.status.success() {
+            log::info!("Region recording cancelled by user");
+            return Err(UiError::Ui("Region selection cancelled".to_string()));
+        }
+
+        let rect_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        log::info!("Selected region: {rect_str}");
+
+        let path = self.storage.resolve_path(CaptureType::Recording)?;
+
+        let mut cmd = Command::new("screencapture");
+        cmd.arg("-v");
+        cmd.arg("-R").arg(&rect_str);
+        if self.config.recording.capture_microphone {
+            cmd.arg("-g");
+        }
+        cmd.arg(&path);
+        cmd.stdin(std::process::Stdio::piped());
+
+        let child = cmd.spawn().map_err(|e| {
+            UiError::Ui(format!("Failed to start screencapture: {e}"))
+        })?;
+
+        log::info!("Region recording started: {}", path.display());
 
         self.recording_session = Some(RecordingSession {
             child,
@@ -189,7 +252,7 @@ impl App {
             }
 
             if session.output_path.exists() {
-                self.last_capture = Some(session.output_path.clone());
+                self.add_recent_capture(session.output_path.clone());
                 self.post_capture_actions(&session.output_path);
                 return Ok(Some(session.output_path));
             } else {
@@ -220,7 +283,7 @@ impl App {
 
     /// Open the last captured file in Finder.
     pub fn open_last_capture(&self) -> Result<(), UiError> {
-        if let Some(path) = &self.last_capture {
+        if let Some(path) = self.recent_captures.front() {
             StorageManager::reveal_in_finder(path)?;
         }
         Ok(())
@@ -245,19 +308,23 @@ impl App {
     }
 }
 
+/// Copy the actual file to the clipboard so it can be pasted into apps.
 fn copy_to_clipboard(path: &PathBuf) {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(path.to_string_lossy().as_bytes());
-                }
-                child.wait()
-            });
+        let path_str = path.to_string_lossy();
+        // Use NSPasteboard via osascript to copy the file itself (not the path)
+        let script = format!(
+            r#"use framework "AppKit"
+set pb to current application's NSPasteboard's generalPasteboard()
+pb's clearContents()
+set fileURL to current application's NSURL's fileURLWithPath:"{path_str}"
+pb's writeObjects:{{fileURL}}"#
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output();
     }
 }
 
@@ -286,12 +353,11 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
     use std::sync::mpsc;
     use tao::event::{Event, StartCause};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use tray_icon::TrayIconBuilder;
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<AppCommand>();
 
-    // App lives entirely on the main thread — no Arc<Mutex> needed
     let mut app = App::new(config.clone());
 
     let event_loop = EventLoopBuilder::new().build();
@@ -299,10 +365,22 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
     // Build tray menu
     let menu = Menu::new();
 
-    let screenshot_item = MenuItem::new("Take Screenshot          Cmd+Shift+3", true, None);
-    let region_item = MenuItem::new("Capture Region            Cmd+Shift+4", true, None);
-    let record_item = MenuItem::new("Start Recording          Cmd+Shift+5", true, None);
-    let open_last_item = MenuItem::new("Open Last Capture", false, None);
+    let screenshot_item = MenuItem::new("Take Screenshot          Ctrl+Shift+1", true, None);
+    let region_item = MenuItem::new("Capture Region            Ctrl+Shift+2", true, None);
+    let record_item = MenuItem::new("Start Recording          Ctrl+Shift+3", true, None);
+    let region_record_item = MenuItem::new("Record Region             Ctrl+Shift+4", true, None);
+
+    // Recent Captures submenu with 5 pre-allocated slots
+    let recent_submenu = Submenu::new("Recent Captures", true);
+    let recent_empty_item = MenuItem::new("No captures yet", false, None);
+    let _ = recent_submenu.append(&recent_empty_item);
+
+    let mut recent_items: Vec<IconMenuItem> = Vec::with_capacity(MAX_RECENT_CAPTURES);
+    for _ in 0..MAX_RECENT_CAPTURES {
+        let item = IconMenuItem::new("", false, None, None);
+        recent_items.push(item);
+    }
+
     let open_folder_item = MenuItem::new("Open Capture Folder", true, None);
     let quit_item = MenuItem::new("Quit Captura", true, None);
 
@@ -310,8 +388,9 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
     let _ = menu.append(&region_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&record_item);
+    let _ = menu.append(&region_record_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&open_last_item);
+    let _ = menu.append(&recent_submenu);
     let _ = menu.append(&open_folder_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&quit_item);
@@ -319,11 +398,11 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
     let screenshot_id = screenshot_item.id().clone();
     let region_id = region_item.id().clone();
     let record_id = record_item.id().clone();
-    let open_last_id = open_last_item.id().clone();
+    let region_record_id = region_record_item.id().clone();
+    let recent_item_ids: Vec<_> = recent_items.iter().map(|i| i.id().clone()).collect();
     let open_folder_id = open_folder_item.id().clone();
     let quit_id = quit_item.id().clone();
 
-    // Create a simple camera icon (16x16 white on transparent)
     let icon = create_tray_icon();
 
     let _tray = TrayIconBuilder::new()
@@ -334,7 +413,48 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
         .build()
         .map_err(|e| UiError::Ui(format!("failed to create tray icon: {e}")))?;
 
-    // Hotkey thread — sends commands via channel
+    // Helper closure to sync the Recent Captures submenu with app state
+    let update_recent_menu =
+        |app: &App, submenu: &Submenu, items: &[IconMenuItem], empty_item: &MenuItem| {
+            let captures = app.recent_captures();
+
+            if captures.is_empty() {
+                // Show "No captures yet" placeholder
+                let _ = empty_item.set_enabled(false);
+                // Remove any old items, re-add placeholder
+                for item in items.iter() {
+                    let _ = submenu.remove(item);
+                }
+                // Ensure placeholder is in submenu
+                let _ = submenu.remove(empty_item);
+                let _ = submenu.append(empty_item);
+                return;
+            }
+
+            // Remove placeholder
+            let _ = submenu.remove(empty_item);
+
+            // Update each slot
+            for (i, item) in items.iter().enumerate() {
+                if let Some(path) = captures.get(i) {
+                    let filename = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let _ = item.set_text(&format!("  Copy: {filename}"));
+                    let _ = item.set_enabled(true);
+                    item.set_icon(generate_thumbnail(path));
+                    // Ensure it's in the submenu
+                    let _ = submenu.remove(item);
+                    let _ = submenu.append(item);
+                } else {
+                    let _ = submenu.remove(item);
+                }
+            }
+        };
+
+    // Hotkey thread
     let hk_tx = cmd_tx.clone();
     let hk_config = config.clone();
     std::thread::spawn(move || {
@@ -349,6 +469,7 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
         let _ = hk_mgr.register("screenshot", &hk_config.hotkeys.screenshot);
         let _ = hk_mgr.register("toggle_recording", &hk_config.hotkeys.toggle_recording);
         let _ = hk_mgr.register("region_screenshot", &hk_config.hotkeys.region_screenshot);
+        let _ = hk_mgr.register("region_recording", &hk_config.hotkeys.region_recording);
 
         loop {
             match hk_mgr.next_event() {
@@ -357,6 +478,7 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
                         "screenshot" => AppCommand::TakeScreenshot,
                         "toggle_recording" => AppCommand::ToggleRecording,
                         "region_screenshot" => AppCommand::TakeRegionScreenshot,
+                        "region_recording" => AppCommand::ToggleRegionRecording,
                         _ => continue,
                     };
                     if hk_tx.send(cmd).is_err() {
@@ -371,7 +493,7 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
         }
     });
 
-    // Config watcher — sends UpdateConfig commands via channel
+    // Config watcher
     let watcher_tx = cmd_tx;
     let _watcher = Config::watch(move |new_config| {
         let _ = watcher_tx.send(AppCommand::UpdateConfig(new_config));
@@ -382,22 +504,69 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
+        let mut menu_changed = false;
+
         // Process commands from hotkey/config threads
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 AppCommand::TakeScreenshot => {
                     if let Err(e) = app.take_screenshot() {
                         log::error!("Screenshot failed: {e}");
+                    } else {
+                        menu_changed = true;
                     }
                 }
                 AppCommand::TakeRegionScreenshot => {
-                    if let Err(e) = app.take_region_screenshot_interactive() {
-                        log::error!("Region screenshot failed: {e}");
+                    match app.take_region_screenshot_interactive() {
+                        Ok(Some(_)) => menu_changed = true,
+                        Ok(None) => {}
+                        Err(e) => log::error!("Region screenshot failed: {e}"),
                     }
                 }
                 AppCommand::ToggleRecording => {
-                    if let Err(e) = app.toggle_recording() {
-                        log::error!("Toggle recording failed: {e}");
+                    match app.state() {
+                        AppState::Idle => {
+                            if let Err(e) = app.start_recording() {
+                                log::error!("Start recording failed: {e}");
+                            } else {
+                                let _ = record_item
+                                    .set_text("● Stop Recording          Ctrl+Shift+3");
+                                let _ = region_record_item.set_enabled(false);
+                            }
+                        }
+                        AppState::Recording => {
+                            if let Err(e) = app.stop_recording() {
+                                log::error!("Stop recording failed: {e}");
+                            } else {
+                                menu_changed = true;
+                            }
+                            let _ = record_item
+                                .set_text("Start Recording          Ctrl+Shift+3");
+                            let _ = region_record_item.set_enabled(true);
+                        }
+                    }
+                }
+                AppCommand::ToggleRegionRecording => {
+                    match app.state() {
+                        AppState::Idle => {
+                            if let Err(e) = app.start_region_recording() {
+                                log::error!("Start region recording failed: {e}");
+                            } else {
+                                let _ = region_record_item
+                                    .set_text("● Stop Recording          Ctrl+Shift+4");
+                                let _ = record_item.set_enabled(false);
+                            }
+                        }
+                        AppState::Recording => {
+                            if let Err(e) = app.stop_recording() {
+                                log::error!("Stop recording failed: {e}");
+                            } else {
+                                menu_changed = true;
+                            }
+                            let _ = region_record_item
+                                .set_text("Record Region             Ctrl+Shift+4");
+                            let _ = record_item.set_enabled(true);
+                        }
                     }
                 }
                 AppCommand::UpdateConfig(new_config) => {
@@ -412,10 +581,14 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
             if menu_event.id == screenshot_id {
                 if let Err(e) = app.take_screenshot() {
                     log::error!("Screenshot failed: {e}");
+                } else {
+                    menu_changed = true;
                 }
             } else if menu_event.id == region_id {
-                if let Err(e) = app.take_region_screenshot_interactive() {
-                    log::error!("Region screenshot failed: {e}");
+                match app.take_region_screenshot_interactive() {
+                    Ok(Some(_)) => menu_changed = true,
+                    Ok(None) => {}
+                    Err(e) => log::error!("Region screenshot failed: {e}"),
                 }
             } else if menu_event.id == record_id {
                 match app.state() {
@@ -423,19 +596,42 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
                         if let Err(e) = app.start_recording() {
                             log::error!("Start recording failed: {e}");
                         } else {
-                            let _ = record_item.set_text("● Stop Recording          Cmd+Shift+5");
+                            let _ =
+                                record_item.set_text("● Stop Recording          Ctrl+Shift+3");
+                            let _ = region_record_item.set_enabled(false);
                         }
                     }
                     AppState::Recording => {
                         if let Err(e) = app.stop_recording() {
                             log::error!("Stop recording failed: {e}");
+                        } else {
+                            menu_changed = true;
                         }
-                        let _ = record_item.set_text("Start Recording          Cmd+Shift+5");
+                        let _ = record_item.set_text("Start Recording          Ctrl+Shift+3");
+                        let _ = region_record_item.set_enabled(true);
                     }
                 }
-            } else if menu_event.id == open_last_id {
-                if let Err(e) = app.open_last_capture() {
-                    log::error!("Open last capture failed: {e}");
+            } else if menu_event.id == region_record_id {
+                match app.state() {
+                    AppState::Idle => {
+                        if let Err(e) = app.start_region_recording() {
+                            log::error!("Start region recording failed: {e}");
+                        } else {
+                            let _ = region_record_item
+                                .set_text("● Stop Recording          Ctrl+Shift+4");
+                            let _ = record_item.set_enabled(false);
+                        }
+                    }
+                    AppState::Recording => {
+                        if let Err(e) = app.stop_recording() {
+                            log::error!("Stop recording failed: {e}");
+                        } else {
+                            menu_changed = true;
+                        }
+                        let _ = region_record_item
+                            .set_text("Record Region             Ctrl+Shift+4");
+                        let _ = record_item.set_enabled(true);
+                    }
                 }
             } else if menu_event.id == open_folder_id {
                 if let Err(e) = app.open_capture_folder() {
@@ -444,18 +640,106 @@ pub fn run_event_loop(config: Config) -> Result<(), UiError> {
             } else if menu_event.id == quit_id {
                 let _ = app.stop_recording();
                 *control_flow = ControlFlow::Exit;
+            } else {
+                // Check if it's a recent capture item — copy path to clipboard
+                for (i, rid) in recent_item_ids.iter().enumerate() {
+                    if menu_event.id == *rid {
+                        if let Some(path) = app.recent_captures().get(i) {
+                            copy_to_clipboard(path);
+                            log::info!("Copied to clipboard: {}", path.display());
+                            show_notification_copied(path);
+                        }
+                        break;
+                    }
+                }
             }
+        }
 
-            // Enable "Open Last Capture" once we have one
-            if app.last_capture().is_some() {
-                let _ = open_last_item.set_enabled(true);
-            }
+        if menu_changed {
+            update_recent_menu(&app, &recent_submenu, &recent_items, &recent_empty_item);
         }
 
         if let Event::NewEvents(StartCause::Init) = event {
             log::info!("Captura UI initialized");
         }
     });
+}
+
+fn show_notification_copied(path: &PathBuf) {
+    #[cfg(target_os = "macos")]
+    {
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+
+        let script = format!(
+            r#"display notification "Path copied: {filename}" with title "Captura""#
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .spawn();
+    }
+}
+
+/// Find a helper binary. Looks next to the current executable, then in helpers/.
+fn find_helper(name: &str) -> PathBuf {
+    // Next to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Fallback: helpers/ relative to working directory
+    let candidate = PathBuf::from(format!("helpers/{name}"));
+    if candidate.exists() {
+        return candidate;
+    }
+    // Last resort: just the name, hope it's in PATH
+    PathBuf::from(name)
+}
+
+/// Generate a thumbnail icon from a capture file for use in menu items.
+/// Returns None if the file can't be loaded or isn't a supported image.
+fn generate_thumbnail(path: &std::path::Path) -> Option<tray_icon::menu::Icon> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+
+    let img = match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tiff" | "webp" => {
+            image::open(path).ok()?.into_rgba8()
+        }
+        "mp4" | "mov" | "mkv" => {
+            // For videos, extract a frame via ffmpeg to a temp file
+            let tmp = std::env::temp_dir().join("captura_thumb.png");
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-y", "-i"])
+                .arg(path)
+                .args(["-vframes", "1", "-vf", "scale=36:-1"])
+                .arg(&tmp)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()?;
+            if !status.success() {
+                return None;
+            }
+            let img = image::open(&tmp).ok()?.into_rgba8();
+            let _ = std::fs::remove_file(&tmp);
+            img
+        }
+        _ => return None,
+    };
+
+    // Resize to fit within 18x18 (menu bar appropriate size)
+    let thumb = image::imageops::resize(&img, 18, 18, image::imageops::FilterType::Lanczos3);
+    let width = thumb.width();
+    let height = thumb.height();
+    let rgba = thumb.into_raw();
+
+    tray_icon::menu::Icon::from_rgba(rgba, width, height).ok()
 }
 
 /// Create a simple 22x22 camera icon for the menu bar.

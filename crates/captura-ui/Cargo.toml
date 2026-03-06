@@ -10,6 +10,7 @@ captura-storage = { path = "../captura-storage" }
 captura-hotkeys = { path = "../captura-hotkeys" }
 thiserror = { workspace = true }
 log = { workspace = true }
+image = { workspace = true }
 tao = "0.31"
 tray-icon = "0.19"
 libc = "0.2"

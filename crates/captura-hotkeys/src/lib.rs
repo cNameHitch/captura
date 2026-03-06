@@ -1,5 +1,5 @@
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::collections::HashMap;
 use std::sync::mpsc;
 
@@ -103,6 +103,11 @@ impl HotkeyManager {
                 .rx
                 .recv()
                 .map_err(|_| HotkeyError::ReceiverDisconnected)?;
+
+            // Only fire on key press, not release
+            if event.state != HotKeyState::Pressed {
+                continue;
+            }
 
             if let Some(id) = self.id_map.get(&event.id) {
                 return Ok(id.clone());
